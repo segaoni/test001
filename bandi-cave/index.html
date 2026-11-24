@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>반디의 동굴</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jua&family=Noto+Sans+KR:wght@400;700&display=swap">
+<style>
+/* Layout: one-screen arcade. A 9:16 cave canvas centered on a deep moss-dark ground. Single dark look by choice. */
+:root {
+  --ground: #0b1412;      /* cave darkness around the stage */
+  --rock: #1d2a2b;        /* rock body */
+  --glow: #ffe27a;        /* firefly light */
+  --moss: #6fd3a8;        /* bioluminescent moss / accent */
+  --ink: #e8f1ea;         /* text */
+  --muted: #8fa59c;       /* secondary text */
+  --font-display: "Jua", "Noto Sans KR", system-ui, sans-serif;
+  --font-body: "Noto Sans KR", system-ui, -apple-system, sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--ground); color: var(--ink); font-family: var(--font-body);
+  display: flex; align-items: center; justify-content: center;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 12px; box-sizing: border-box; overflow: hidden;
+  -webkit-user-select: none; user-select: none; touch-action: manipulation;
+}
+.stage {
+  position: relative; height: 100%; max-height: 900px; aspect-ratio: 9 / 16; max-width: 100%;
+  border-radius: 18px; overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(111,211,168,.18), 0 20px 60px rgba(0,0,0,.6);
+}
+canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
+.mute {
+  position: absolute; top: 12px; right: 12px; width: 38px; height: 38px; border-radius: 50%;
+  border: 1px solid rgba(232,241,234,.25); background: rgba(11,20,18,.55); color: var(--ink);
+  font: 700 12px var(--font-body); cursor: pointer;
+}
+.mute:focus-visible { outline: 2px solid var(--moss); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<div class="stage" id="stage">
+  <canvas id="game" aria-label="반디의 동굴 게임 화면. 스페이스바나 탭으로 날갯짓"></canvas>
+  <button class="mute" id="mute" type="button" aria-label="소리 끄기">♪</button>
+</div>
+
+<script>
+(() => {
+  const W = 360, H = 640, FLOOR = H - 56;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const stage = document.getElementById('stage');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function resize() {
+    const r = stage.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(r.width * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+  }
+  addEventListener('resize', resize);
+
+  // ---------- storage ----------
+  let best = 0;
+  try { best = +localStorage.getItem('bandi-best') || 0; } catch (e) {}
+  const saveBest = () => { try { localStorage.setItem('bandi-best', best); } catch (e) {} };
+
+  // ---------- audio (synthesized) ----------
+  let actx = null, muted = false;
+  const muteBtn = document.getElementById('mute');
+  muteBtn.addEventListener('click', e => { e.stopPropagation(); muted = !muted;
+    muteBtn.textContent = muted ? '×' : '♪'; muteBtn.setAttribute('aria-label', muted ? '소리 켜기' : '소리 끄기'); });
+  muteBtn.addEventListener('pointerdown', e => e.stopPropagation());
+  function tone(f1, f2, dur, type = 'sine', vol = .12, delay = 0) {
+    if (muted) return;
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+      o.type = type; o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+      g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+      o.connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + .02);
+    } catch (e) {}
+  }
+  const sfx = {
+    flap: () => tone(520, 880, .09, 'triangle', .07),
+    point: () => { tone(988, 988, .12, 'sine', .08); tone(1318, 1318, .18, 'sine', .07, .08); },
+    hit: () => { tone(220, 60, .35, 'sawtooth', .1); },
+  };
+
+  // ---------- world ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  let state = 'ready', score = 0, t = 0, overAt = 0, shake = 0, flash = 0, newBest = false;
+  const bandi = { x: 96, y: H * .42, vy: 0, r: 11 };
+  let rocks = [], spawnTimer = 0, particles = [];
+  const COL_W = 62;
+
+  // parallax layers: precomputed jagged silhouettes
+  function makeRidge(n, base, amp) { const p = []; for (let i = 0; i <= n; i++) p.push(base + rand(-amp, amp)); return p; }
+  const far = { top: makeRidge(24, 70, 30), bot: makeRidge(24, FLOOR - 70, 30), off: 0, speed: .15 };
+  const mid = { top: makeRidge(18, 40, 26), bot: makeRidge(18, FLOOR - 30, 22), off: 0, speed: .4 };
+  const spores = Array.from({ length: 34 }, () => ({ x: rand(0, W), y: rand(0, FLOOR), r: rand(.6, 1.8), s: rand(.2, .8), p: rand(0, 6.28) }));
+
+  function difficulty() {
+    const k = Math.min(score / 40, 1);
+    return { speed: 150 + 70 * k, gap: 168 - 40 * k, every: 1.55 - .3 * k };
+  }
+  function jag(len) { const a = []; const n = Math.max(3, Math.round(len / 26)); for (let i = 0; i < n; i++) a.push(rand(-7, 7)); return a; }
+  function spawnRock() {
+    const { gap } = difficulty();
+    const center = rand(110 + gap / 2 - 40, FLOOR - 70 - gap / 2 + 20);
+    const top = center - gap / 2, bot = center + gap / 2;
+    rocks.push({ x: W + 20, top, bot, passed: false, jt: jag(top), jb: jag(FLOOR - bot),
+      crystals: [rand(.2, .8), rand(.2, .8)], hue: rand(150, 190) });
+  }
+
+  function reset() {
+    state = 'ready'; score = 0; rocks = []; particles = []; spawnTimer = 0; newBest = false;
+    bandi.y = H * .42; bandi.vy = 0;
+  }
+
+  function flap() {
+    if (state === 'ready') { state = 'play'; spawnTimer = .9; }
+    if (state === 'play') {
+      bandi.vy = -400; sfx.flap();
+      for (let i = 0; i < 5; i++) particles.push({ x: bandi.x - 6, y: bandi.y + 4, vx: rand(-90, -30), vy: rand(-20, 60), life: .5, max: .5, c: 'glow' });
+    } else if (state === 'over' && t - overAt > .6) reset();
+  }
+
+  function die() {
+    if (state !== 'play') return;
+    state = 'over'; overAt = t; shake = reduceMotion ? 0 : .3; flash = .25; sfx.hit();
+    if (score > best) { best = score; newBest = score > 0; saveBest(); }
+    for (let i = 0; i < 22; i++) { const a = rand(0, 6.28), v = rand(40, 200);
+      particles.push({ x: bandi.x, y: bandi.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: .9, max: .9, c: 'glow' }); }
+  }
+
+  function circleRect(cx, cy, r, x, y, w, h) {
+    const nx = Math.max(x, Math.min(cx, x + w)), ny = Math.max(y, Math.min(cy, y + h));
+    return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
+  }
+
+  function update(dt) {
+    t += dt;
+    const { speed, every } = difficulty();
+    const scroll = state === 'over' ? 0 : (state === 'ready' ? 60 : speed);
+    far.off += scroll * far.speed * dt; mid.off += scroll * mid.speed * dt;
+    for (const s of spores) { s.x -= scroll * s.s * .3 * dt + 4 * dt; s.y += Math.sin(t + s.p) * 4 * dt; if (s.x < -4) { s.x = W + 4; s.y = rand(0, FLOOR); } }
+
+    if (state === 'ready') { bandi.y = H * .42 + Math.sin(t * 3) * 8; }
+    else {
+      bandi.vy = Math.min(bandi.vy + 1500 * dt, 620);
+      bandi.y += bandi.vy * dt;
+      if (bandi.y < bandi.r) { bandi.y = bandi.r; bandi.vy = 0; }
+      if (bandi.y > FLOOR - bandi.r) { bandi.y = FLOOR - bandi.r; bandi.vy = 0; die(); }
+    }
+
+    if (state === 'play') {
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) { spawnRock(); spawnTimer = every; }
+      for (const r of rocks) {
+        r.x -= speed * dt;
+        if (!r.passed && r.x + COL_W < bandi.x) { r.passed = true; score++; sfx.point(); }
+        const inset = 5; // forgiving hitbox
+        if (circleRect(bandi.x, bandi.y, bandi.r - 2, r.x + inset, -50, COL_W - inset * 2, r.top + 50 - inset) ||
+            circleRect(bandi.x, bandi.y, bandi.r - 2, r.x + inset, r.bot + inset, COL_W - inset * 2, FLOOR - r.bot)) die();
+      }
+      rocks = rocks.filter(r => r.x > -COL_W - 20);
+    }
+
+    for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 120 * dt; p.life -= dt; }
+    particles = particles.filter(p => p.life > 0);
+    shake = Math.max(0, shake - dt); flash = Math.max(0, flash - dt);
+  }
+
+  // ---------- drawing ----------
+  function ridge(layer, pts, fromTop, color) {
+    const seg = W / (pts.length - 2), off = layer.off % seg, shift = Math.floor(layer.off / seg);
+    ctx.fillStyle = color; ctx.beginPath();
+    ctx.moveTo(0, fromTop ? 0 : H);
+    for (let i = 0; i < pts.length; i++) ctx.lineTo(i * seg - off, pts[(i + shift) % pts.length]);
+    ctx.lineTo(W, fromTop ? 0 : H); ctx.closePath(); ctx.fill();
+  }
+
+  function rockColumn(r, isTop) {
+    const x = r.x, w = COL_W;
+    const y0 = isTop ? -10 : FLOOR + 4, y1 = isTop ? r.top : r.bot;
+    const j = isTop ? r.jt : r.jb, n = j.length;
+    // body
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, '#34484a'); g.addColorStop(.55, '#263638'); g.addColorStop(1, '#192426');
+    ctx.fillStyle = g; ctx.beginPath();
+    ctx.moveTo(x + 4, y0);
+    for (let i = 0; i < n; i++) ctx.lineTo(x + j[i] * .5 + (i % 2 ? 0 : 3), y0 + (y1 - y0) * (i / n));
+    // pointed tip toward the gap
+    const tip = isTop ? y1 : y1;
+    ctx.lineTo(x + 2, isTop ? tip - 10 : tip + 10);
+    ctx.lineTo(x + w * .5, isTop ? tip + 6 : tip - 6);
+    ctx.lineTo(x + w - 2, isTop ? tip - 10 : tip + 10);
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(x + w - j[i] * .5 - (i % 2 ? 3 : 0), y0 + (y1 - y0) * (i / n));
+    ctx.lineTo(x + w - 4, y0); ctx.closePath(); ctx.fill();
+    // strata lines
+    ctx.strokeStyle = 'rgba(143,165,156,.12)'; ctx.lineWidth = 1;
+    for (let yy = Math.min(y0, y1) + 18; yy < Math.max(y0, y1) - 14; yy += 22) {
+      ctx.beginPath(); ctx.moveTo(x + 8, yy); ctx.lineTo(x + w - 8, yy + 3); ctx.stroke();
+    }
+    // glowing crystal cluster near tip
+    const cy = isTop ? y1 - 18 : y1 + 18, cx = x + w * r.crystals[isTop ? 0 : 1];
+    ctx.save(); ctx.shadowColor = `hsl(${r.hue} 70% 65%)`; ctx.shadowBlur = 12;
+    ctx.fillStyle = `hsla(${r.hue} 70% 68% / .9)`;
+    for (let k = -1; k <= 1; k++) {
+      const h = k === 0 ? 14 : 9, bx = cx + k * 7;
+      ctx.beginPath();
+      if (isTop) { ctx.moveTo(bx - 3, cy - 4); ctx.lineTo(bx, cy + h - 4); ctx.lineTo(bx + 3, cy - 4); }
+      else { ctx.moveTo(bx - 3, cy + 4); ctx.lineTo(bx, cy - h + 4); ctx.lineTo(bx + 3, cy + 4); }
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBandi() {
+    const { x, y } = bandi;
+    const tilt = state === 'ready' ? 0 : Math.max(-.5, Math.min(1.1, bandi.vy / 600));
+    const pulse = .85 + Math.sin(t * 8) * .15;
+    // halo
+    const halo = ctx.createRadialGradient(x, y, 2, x, y, 70 * pulse);
+    halo.addColorStop(0, 'rgba(255,226,122,.45)'); halo.addColorStop(.35, 'rgba(255,226,122,.12)'); halo.addColorStop(1, 'rgba(255,226,122,0)');
+    ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(x, y, 70 * pulse, 0, 6.29); ctx.fill();
+    ctx.save(); ctx.translate(x, y); ctx.rotate(tilt);
+    // wings (flutter)
+    const wf = state === 'over' ? .2 : Math.sin(t * (bandi.vy < 0 ? 40 : 22)) * .6;
+    ctx.fillStyle = 'rgba(214,236,255,.55)';
+    ctx.save(); ctx.rotate(-.9 + wf); ctx.beginPath(); ctx.ellipse(0, -9, 5, 11, 0, 0, 6.29); ctx.fill(); ctx.restore();
+    ctx.save(); ctx.rotate(-.4 + wf * .7); ctx.beginPath(); ctx.ellipse(2, -8, 4, 9, 0, 0, 6.29); ctx.fill(); ctx.restore();
+    // glowing abdomen (back)
+    ctx.save(); ctx.shadowColor = '#ffe27a'; ctx.shadowBlur = 18 * pulse;
+    ctx.fillStyle = '#ffe27a'; ctx.beginPath(); ctx.ellipse(-7, 2, 8, 7, 0, 0, 6.29); ctx.fill(); ctx.restore();
+    ctx.fillStyle = '#fff6c9'; ctx.beginPath(); ctx.ellipse(-8, 1, 4, 3.5, 0, 0, 6.29); ctx.fill();
+    // body + head
+    ctx.fillStyle = '#3a2f4a'; ctx.beginPath(); ctx.ellipse(3, 0, 7, 6, 0, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#e46a5a'; ctx.beginPath(); ctx.arc(10, -1, 5, 0, 6.29); ctx.fill();
+    // eye
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(12, -2.5, 2.3, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(12.8, -2.5, 1.2, 0, 6.29); ctx.fill();
+    // antennae
+    ctx.strokeStyle = '#3a2f4a'; ctx.lineWidth = 1.2; ctx.beginPath();
+    ctx.moveTo(11, -5); ctx.quadraticCurveTo(14, -13, 19, -12);
+    ctx.moveTo(9, -5); ctx.quadraticCurveTo(10, -14, 15, -15); ctx.stroke();
+    ctx.restore();
+  }
+
+  function text(str, x, y, size, color, align = 'center', font = 'display') {
+    ctx.font = `${size}px ${font === 'display' ? '"Jua", "Noto Sans KR", sans-serif' : '700 ' + '"Noto Sans KR", sans-serif'}`;
+    if (font !== 'display') ctx.font = `700 ${size}px "Noto Sans KR", sans-serif`;
+    ctx.textAlign = align; ctx.textBaseline = 'middle';
+    ctx.lineWidth = Math.max(3, size / 7); ctx.strokeStyle = 'rgba(8,14,13,.85)'; ctx.lineJoin = 'round';
+    ctx.strokeText(str, x, y); ctx.fillStyle = color; ctx.fillText(str, x, y);
+  }
+
+  function rank(s) {
+    if (s >= 50) return '전설의 반디'; if (s >= 25) return '빛의 길잡이';
+    if (s >= 10) return '동굴 탐험가'; return '새내기 반디';
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) ctx.translate(rand(-4, 4) * shake * 3, rand(-4, 4) * shake * 3);
+    // background
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#0e1a1f'); bg.addColorStop(.6, '#12211f'); bg.addColorStop(1, '#0a1210');
+    ctx.fillStyle = bg; ctx.fillRect(-10, -10, W + 20, H + 20);
+    ridge(far, far.top, true, '#15242a'); ridge(far, far.bot, false, '#15242a');
+    // spores
+    for (const s of spores) { ctx.fillStyle = `rgba(111,211,168,${.25 + .25 * Math.sin(t * 2 + s.p)})`; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.29); ctx.fill(); }
+    ridge(mid, mid.top, true, '#101c1d'); ridge(mid, mid.bot, false, '#101c1d');
+
+    for (const r of rocks) { rockColumn(r, true); rockColumn(r, false); }
+
+    // floor: moss band
+    ctx.fillStyle = '#0d1715'; ctx.fillRect(0, FLOOR, W, H - FLOOR);
+    ctx.fillStyle = '#2f6e57'; ctx.fillRect(0, FLOOR, W, 5);
+    const mo = (far.off * 6) % 18;
+    ctx.fillStyle = 'rgba(111,211,168,.55)';
+    for (let x = -mo; x < W + 18; x += 18) { ctx.beginPath(); ctx.moveTo(x, FLOOR + 1); ctx.lineTo(x + 4, FLOOR - 5); ctx.lineTo(x + 8, FLOOR + 1); ctx.fill(); }
+    ctx.fillStyle = 'rgba(143,165,156,.35)'; ctx.font = '700 10px "Noto Sans KR", sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(`깊이 ${Math.floor(far.off / 8)} m`, 14, FLOOR + 30);
+
+    for (const p of particles) { ctx.fillStyle = `rgba(255,226,122,${p.life / p.max})`; ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 6.29); ctx.fill(); }
+    drawBandi();
+    ctx.restore();
+
+    if (flash > 0) { ctx.fillStyle = `rgba(255,240,200,${flash * 1.6})`; ctx.fillRect(0, 0, W, H); }
+
+    // HUD
+    if (state === 'play') text(String(score), W / 2, 70, 56, '#fff6c9');
+    if (state === 'ready') {
+      text('반디의 동굴', W / 2, 150, 46, '#ffe27a');
+      text('바위 틈새로 반딧불이를 날려 보내세요', W / 2, 196, 14, '#e8f1ea', 'center', 'body');
+      const a = .6 + .4 * Math.sin(t * 4);
+      ctx.globalAlpha = a; text('스페이스바 · 클릭 · 탭', W / 2, H * .62, 22, '#6fd3a8'); ctx.globalAlpha = 1;
+      text('누를 때마다 날갯짓!', W / 2, H * .62 + 32, 13, '#8fa59c', 'center', 'body');
+      if (best > 0) text(`최고 기록 ${best}`, W / 2, H * .62 + 68, 16, '#e8f1ea', 'center', 'body');
+    }
+    if (state === 'over') {
+      ctx.fillStyle = 'rgba(8,14,13,.55)'; ctx.fillRect(0, 0, W, H);
+      // panel
+      const px = 40, py = 170, pw = W - 80, ph = 240;
+      ctx.fillStyle = 'rgba(20,34,32,.95)'; ctx.strokeStyle = 'rgba(111,211,168,.4)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 16); ctx.fill(); ctx.stroke();
+      text('빛이 꺼졌어요', W / 2, py + 38, 30, '#ffe27a');
+      text('점수', W / 2 - 60, py + 88, 13, '#8fa59c', 'center', 'body');
+      text('최고', W / 2 + 60, py + 88, 13, '#8fa59c', 'center', 'body');
+      text(String(score), W / 2 - 60, py + 124, 42, '#fff6c9');
+      text(String(best), W / 2 + 60, py + 124, 42, newBest ? '#6fd3a8' : '#e8f1ea');
+      if (newBest) text('새 기록!', W / 2 + 60, py + 156, 13, '#6fd3a8', 'center', 'body');
+      text(`등급: ${rank(score)}`, W / 2, py + 192, 16, '#e8f1ea', 'center', 'body');
+      if (t - overAt > .6) { ctx.globalAlpha = .6 + .4 * Math.sin(t * 4); text('탭해서 다시 하기', W / 2, py + ph + 44, 22, '#6fd3a8'); ctx.globalAlpha = 1; }
+    }
+  }
+
+  // ---------- input ----------
+  addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { e.preventDefault(); if (!e.repeat) flap(); }
+    if (e.code === 'KeyM') muteBtn.click();
+  });
+  canvas.addEventListener('pointerdown', e => { e.preventDefault(); flap(); });
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30); last = now;
+    update(dt); draw(); requestAnimationFrame(frame);
+  }
+  resize();
+  (document.fonts ? document.fonts.ready : Promise.resolve()).finally(() => {});
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
